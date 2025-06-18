@@ -16,12 +16,14 @@ SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT']
 LOWER_TIMEFRAME = '15m'
 HIGHER_TIMEFRAME = '1h'
 EXCHANGE_NAME = 'kraken'
-DETECTION_MODE = 'FVG'
 CANDLE_LIMIT = 100
 CHECK_INTERVAL_SECONDS = 300
 ATR_PERIOD = 14
 BUFFER_ATR_MULTIPLIER = 1.5
 RR_RATIO = 2.0
+
+# Cache BOS and POI state
+bos_state = {}  # Format: {symbol: {'type': 'Bullish BOS', 'timestamp': xxx}}
 alerted_pois = {}
 
 def calculate_atr(ohlcv, period=14):
@@ -44,8 +46,8 @@ def detect_bos(ohlcv, lookback=5):
     highs, lows = find_swing_points(ohlcv, lookback)
     if len(highs) < 2 or len(lows) < 2: return None
     price = ohlcv[-1][4]
-    if price > highs[-2]['h']: return 'Bullish BOS'
-    if price < lows[-2]['l']: return 'Bearish BOS'
+    if price > highs[-2]['h']: return {'type': 'Bullish BOS', 'timestamp': ohlcv[-1][0]}
+    if price < lows[-2]['l']: return {'type': 'Bearish BOS', 'timestamp': ohlcv[-1][0]}
     return None
 
 def find_latest_fvg(ohlcv):
@@ -78,11 +80,23 @@ async def analyze_symbol(symbol, bot):
     try:
         high_tf = await exchange.fetch_ohlcv(symbol, HIGHER_TIMEFRAME, limit=CANDLE_LIMIT)
         bos = detect_bos(high_tf)
-        if not bos: return
+        if bos:
+            bos_state[symbol] = bos
 
+        if symbol not in bos_state:
+            return
+
+        bos_type = bos_state[symbol]['type']
         low_tf = await exchange.fetch_ohlcv(symbol, LOWER_TIMEFRAME, limit=CANDLE_LIMIT)
-        poi = find_latest_fvg(low_tf) if DETECTION_MODE == 'FVG' else None
-        if not poi: return
+        poi = find_latest_fvg(low_tf)
+        if not poi:
+            return
+
+        # Cek apakah FVG searah dengan BOS
+        if bos_type.startswith('Bullish') and not poi['type'].startswith('Bullish'):
+            return
+        if bos_type.startswith('Bearish') and not poi['type'].startswith('Bearish'):
+            return
 
         price = low_tf[-1][4]
         if poi['min_price'] <= price <= poi['max_price']:
@@ -93,7 +107,7 @@ async def analyze_symbol(symbol, bot):
                 message = (
                     f"🚨 *ENTRY ALERT* 🚨\n\n"
                     f"*{symbol}* memasuki zona `{poi['type']}`\n"
-                    f"Konfirmasi: `{bos}` di `{HIGHER_TIMEFRAME}`\n\n"
+                    f"Konfirmasi: `{bos_type}` di `{HIGHER_TIMEFRAME}`\n\n"
                     f"💰 Entry: `${levels['entry']:.4f}`\n"
                     f"🛑 SL: `${levels['sl']:.4f}`\n"
                     f"🎯 TP: `${levels['tp']:.4f}`\n"
@@ -113,8 +127,8 @@ async def main():
         return
 
     bot = Bot(token=TELEGRAM_TOKEN)
-    await send_telegram_message(bot, f"✅ Bot Aktif. Mode: `{DETECTION_MODE}`")
-    
+    await send_telegram_message(bot, f"✅ Bot Aktif. Menunggu harga menyentuh POI setelah BOS...")
+
     while True:
         print(f"\n=== Cycle @ {time.strftime('%H:%M:%S')} ===")
         tasks = [analyze_symbol(symbol, bot) for symbol in SYMBOLS]
