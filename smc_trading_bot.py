@@ -5,12 +5,13 @@ from telegram import Bot
 from telegram.error import TelegramError
 import pandas as pd
 import numpy as np
+import os 
 
 nest_asyncio.apply()
 
 # --- KONFIGURASI ---
-TELEGRAM_TOKEN = '8142661506:AAHC36iPaWuT-U4hUTrSpRzfwPu2jgT3dDY'
-CHAT_ID = '1784411799'
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
 SYMBOLS = [
     'BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT',
     'ADA/USDT', 'AVAX/USDT', 'TON/USDT', 'SHIB/USDT', 'LTC/USDT'
