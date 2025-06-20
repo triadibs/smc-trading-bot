@@ -1,5 +1,5 @@
-python-telegram-bot
 ccxt
 nest_asyncio
+python-telegram-bot
 pandas
-numpy
+google-generativeai

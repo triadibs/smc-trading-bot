@@ -1,5 +1,11 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
+
 WORKDIR /app
-COPY main.py .
-RUN pip install ccxt nest_asyncio python-telegram-bot pandas google-generativeai
+
+COPY main.py /app/
+
+# Install dependencies jika ada, misal:
+COPY requirements.txt /app/
+ RUN pip install -r requirements.txt
+
 CMD ["python", "main.py"]
