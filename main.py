@@ -1,44 +1,57 @@
-
 import os
 import asyncio
 import ccxt.async_support as ccxt
 import nest_asyncio
 import json
 import pandas as pd
-import numpy as np
+import logging
 from telegram import Bot
 import google.generativeai as genai
 
 # Menerapkan nest_asyncio agar asyncio bisa berjalan di lingkungan seperti notebook
 nest_asyncio.apply()
 
-# --- 1. Konfigurasi & Inisialisasi ---
+# --- 1. Konfigurasi Logging ---
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-# Memuat variabel dari environment (pastikan Anda sudah mengaturnya)
+# --- 2. Konfigurasi & Inisialisasi ---
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 
-# Memastikan semua variabel environment telah diisi
-assert all([GEMINI_API_KEY, TELEGRAM_TOKEN, CHAT_ID]), "Variabel ENV (GEMINI_API_KEY, TELEGRAM_TOKEN, CHAT_ID) belum lengkap!"
+# Validasi variabel lingkungan
+missing_vars = [var for var in ['GEMINI_API_KEY', 'TELEGRAM_TOKEN', 'CHAT_ID'] if not os.getenv(var)]
+if missing_vars:
+    logging.error(f"Variabel lingkungan berikut belum diatur: {', '.join(missing_vars)}")
+    raise ValueError(f"Variabel lingkungan berikut belum diatur: {', '.join(missing_vars)}")
 
 # Inisialisasi layanan
 genai.configure(api_key=GEMINI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
-exchange = None # Akan diinisialisasi di dalam main()
+exchange = None  # Akan diinisialisasi di main()
 
-# --- 2. Pengaturan Strategi ---
+# --- 3. Pengaturan Strategi ---
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT']
+TIMEFRAME = '15m'
+EXCHANGE_NAME = 'kraken'
+CANDLES = 200
+INTERVAL = 300  # 5 menit
+ALERTED_MAX_AGE = 86400  # 24 jam (dalam detik) untuk pembersihan alerted
 
-SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT']  # Simbol yang akan dianalisis
-TIMEFRAME = '15m'                 # Timeframe yang digunakan (diubah dari 15m ke 1H sesuai kode Anda)
-EXCHANGE_NAME = 'kraken'         # Ganti dengan exchange pilihan Anda (kraken, bybit, dll)
-CANDLES = 200                    # Jumlah candle yang diambil untuk analisis
-INTERVAL = 300                   # Jeda waktu antar siklus analisis dalam detik (300 detik = 5 menit)
-
-# Dictionary untuk melacak notifikasi yang sudah terkirim
+# Dictionary untuk melacak notifikasi
 alerted = {}
 
-# --- 3. Fungsi Deteksi ---
+# --- 4. Fungsi Pendukung ---
+def clean_alerted():
+    """Membersihkan entri alerted yang lebih tua dari ALERTED_MAX_AGE."""
+    current_time = pd.Timestamp.now().timestamp() * 1000
+    global alerted
+    alerted = {k: v for k, v in alerted.items() if current_time - float(k.split('_')[-1]) < ALERTED_MAX_AGE * 1000}
+    logging.info("Membersihkan entri alerted yang kadaluarsa.")
 
 def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5, use_wicks: bool = True) -> dict | None:
     """
@@ -49,19 +62,23 @@ def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5,
 
     for i in range(len(df_) - 1, ob_period, -1):
         window = df_.iloc[i - ob_period : i]
-        
         potential_ob_candle = window.iloc[0]
         subsequent_candles = window.iloc[1:]
 
         close_ob_potential = potential_ob_candle['c']
         close_last_in_sequence = subsequent_candles.iloc[-1]['c']
         
-        if close_ob_potential == 0: continue
+        if close_ob_potential == 0:
+            continue
             
         absmove = ((abs(close_last_in_sequence - close_ob_potential)) / close_ob_potential) * 100
         relmove = absmove >= threshold
 
         if not relmove:
+            continue
+
+        # Validasi volume
+        if potential_ob_candle['v'] < df_['v'].mean() * 1.5:
             continue
 
         is_potential_bullish_ob = potential_ob_candle['c'] < potential_ob_candle['o']
@@ -73,7 +90,7 @@ def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5,
             return {'type': 'Bullish', 'min': ob_low, 'max': ob_high, 't': potential_ob_candle['t']}
 
         is_potential_bearish_ob = potential_ob_candle['c'] > potential_ob_candle['o']
-        are_subsequent_down = (subsequent_candles['c'] < subsequent_candles['o']).all()
+        are_subsequent_down = (subsequent_candles['c55.0' < subsequent_candles['o']).all()
 
         if is_potential_bearish_ob and are_subsequent_down:
             ob_high = potential_ob_candle['h']
@@ -82,63 +99,116 @@ def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5,
             
     return None
 
-# --- 4. Fungsi Analisis Inti ---
-
+# --- 5. Fungsi Analisis Inti ---
 async def analyze(symbol: str):
     """
-    Fungsi inti yang menjalankan seluruh alur analisis untuk satu simbol.
-    Fokus hanya pada deteksi Order Block.
+    Menganalisis simbol untuk mendeteksi Order Block dan mengirim notifikasi.
     """
     try:
-        print(f"🔍 Menganalisis {symbol} pada timeframe {TIMEFRAME}...")
-
-        # PENYEMPURNAAN: Menambahkan try-except untuk pengambilan data
-        try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLES)
-            if len(ohlcv) < CANDLES:
-                print(f"[SKIP] Data tidak cukup untuk {symbol} ({len(ohlcv)}/{CANDLES} lilin).")
-                return
-        except Exception as e:
-            print(f"[ERROR] Gagal mengambil data untuk {symbol}: {e}")
-            return # Hentikan analisis untuk simbol ini jika data gagal diambil
+        logging.info(f"Menganalisis {symbol} pada timeframe {TIMEFRAME}")
+        ohlcv = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLES)
+        if len(ohlcv) < CANDLES:
+            logging.warning(f"Data tidak cukup untuk {symbol} ({len(ohlcv)}/{CANDLES} lilin)")
+            return
 
         df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
         current_price = df['c'].iloc[-1]
 
         ob = find_order_block(df)
-        
-        if ob:
-            ob_alert_id = f"{symbol}_OB_{ob['t']}"
-
-            if (ob['min'] <= current_price <= ob['max']) and not alerted.get(ob_alert_id):
-                print(f"🔥 [MATCH OB] Harga {symbol} ({current_price}) masuk ke Order Block.")
-
-                recent_candles = df.tail(50)
-                trade_data = {
-                    "asset": symbol,
-                    "timeframe": TIMEFRAME,
-                    "trade_direction_potential": "BUY" if ob['type'] == 'Bullish' else "SELL",
-                    "entry_price": current_price,
-                    "market_structure": {
-                        "current_swing_high": float(recent_candles['h'].max()),
-                        "current_swing_low": float(recent_candles['l'].min())
-                    },
-                    "order_block": {
-                        "ob_type": ob['type'],
-                        "high": ob['max'],
-                        "low": ob['min'],
-                    },
-                    "primary_target": {
-                        "target_price": float(recent_candles['h'].max()) if ob['type'] == 'Bullish' else float(recent_candles['l'].min()),
-                        "target_description": "Previous Swing High" if ob['type'] == 'Bullish' else "Previous Swing Low"
-                    }
+        if ob and ob['min'] <= current_price <= ob['max'] and not alerted.get(f"{symbol}_OB_{ob['t']}"):
+            logging.info(f"Harga {symbol} ({current_price}) masuk ke Order Block ({ob['type']})")
+            trade_data = {
+                "asset": symbol,
+                "timeframe": TIMEFRAME,
+                "trade_direction_potential": "BUY" if ob['type'] == 'Bullish' else "SELL",
+                "entry_price": current_price,
+                "market_structure": {
+                    "current_swing_high": float(df.tail(50)['h'].max()),
+                    "current_swing_low": float(df.tail(50)['l'].min())
+                },
+                "order_block": {
+                    "ob_type": ob['type'],
+                    "high": ob['max'],
+                    "low": ob['min'],
+                },
+                "primary_target": {
+                    "target_price": float(df.tail(50)['h'].max()) if ob['type'] == 'Bullish' else float(df.tail(50)['l'].min()),
+                    "target_description": "Previous Swing High" if ob['type'] == 'Bullish' else "Previous Swing Low"
                 }
-                
-                # INI ADALAH BAGIAN YANG DIPERBAIKI
-                prompt = f"""
-SYSTEM: Anda adalah seorang analis trading Smart Money Concepts (SMC) profesional. Tugas Anda adalah memberikan rekomendasi Stop Loss (SL) dan Take Profit (TP) yang logis berdasarkan data yang diberikan.
+            }
 
-USER:
-Data Setup Trading:
+            prompt = f"""
+SYSTEM: Anda adalah seorang analis trading Smart Money Concepts (SMC) profesional. Tugas Anda adalah memberikan rekomendasi Stop Loss (SL) dan Take Profit (TP) yang logis berdasarkan data yang diberikan.
+USER: Data Setup Trading:
 ```json
 {json.dumps(trade_data, indent=2)}
+```
+Berikan hasil dalam format JSON dengan field: recommended_sl, recommended_tp, analysis_summary.
+"""
+
+            try:
+                model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                response = model.generate_content(prompt)
+                clean_response = response.text.strip().replace("```json", "").replace("```", "")
+                if not clean_response:
+                    raise ValueError("Respons AI kosong atau tidak valid")
+                analysis_result = json.loads(clean_response)
+                sl = analysis_result.get("recommended_sl", "N/A")
+                tp = analysis_result.get("recommended_tp", "N/A")
+                summary = analysis_result.get("analysis_summary", "Tidak ada ringkasan.")
+
+                message = (
+                    f"🔥 **Sinyal Analisis (Order Block)** 🔥\n\n"
+                    f"*Simbol:* `{symbol}`\n"
+                    f"*Timeframe:* `{TIMEFRAME}`\n"
+                    f"*Harga Masuk:* `{current_price}`\n"
+                    f"*Zona OB ({ob['type']}):* `{ob['min']} - {ob['max']}`\n\n"
+                    f"**Rekomendasi AI:**\n"
+                    f"🛑 **Stop Loss:** `{sl}`\n"
+                    f"🎯 **Take Profit:** `{tp}`\n\n"
+                    f"📝 *Ringkasan:* {summary}"
+                )
+                await bot.send_message(CHAT_ID, message, parse_mode='Markdown')
+                alerted[f"{symbol}_OB_{ob['t']}"] = True
+                logging.info(f"Notifikasi untuk {symbol} dikirim: {message}")
+            except (json.JSONDecodeError, ValueError) as e:
+                logging.error(f"Error parsing AI response untuk {symbol}: {e}\nRaw response: {response.text}")
+                await bot.send_message(CHAT_ID, f"⚠️ Gagal mem-parsing respon AI untuk {symbol}.\nRespon mentah:\n`{response.text}`")
+        else:
+            logging.info(f"Tidak ada Order Block yang valid untuk {symbol}")
+    except Exception as e:
+        logging.error(f"Gagal menganalisis {symbol}: {e}")
+
+# --- 6. Fungsi Utama ---
+async def main():
+    global exchange
+    exchange = ccxt.async_support.kraken({
+        'enableRateLimit': True,
+    })
+    logging.info("Koneksi exchange diinisialisasi")
+
+    try:
+        while True:
+            current_time_str = pd.Timestamp.now(tz='Asia/Jakarta').strftime('%Y-%m-%d %H:%M:%S')
+            logging.info(f"Memulai siklus analisis baru ({current_time_str})")
+            print(f"\n--- Memulai Siklus Analisis Baru ({current_time_str}) ---")
+            
+            clean_alerted()  # Bersihkan alerted sebelum siklus baru
+            await asyncio.gather(*[analyze(sym) for sym in SYMBOLS])
+            
+            print(f"--- Siklus Selesai. Tidur selama {INTERVAL // 60} menit... ---")
+            logging.info(f"Siklus selesai. Menunggu {INTERVAL // 60} menit.")
+            await asyncio.sleep(INTERVAL)
+    except KeyboardInterrupt:
+        logging.info("Bot dihentikan oleh pengguna")
+    except Exception as e:
+        logging.error(f"Kesalahan fatal di loop utama: {e}")
+    finally:
+        if exchange:
+            await exchange.close()
+            logging.info("Koneksi exchange ditutup")
+            await bot.send_message(CHAT_ID, "❌ Bot dihentikan. Koneksi exchange ditutup.")
+
+# --- 7. Jalankan Bot ---
+if __name__ == "__main__":
+    asyncio.run(main())
