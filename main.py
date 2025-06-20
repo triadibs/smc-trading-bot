@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import ccxt.async_support as ccxt
@@ -29,7 +30,7 @@ exchange = None # Akan diinisialisasi di dalam main()
 # --- 2. Pengaturan Strategi ---
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT']  # Simbol yang akan dianalisis
-TIMEFRAME = '1H'                # Timeframe yang digunakan
+TIMEFRAME = '15m'                 # Timeframe yang digunakan (diubah dari 15m ke 1H sesuai kode Anda)
 EXCHANGE_NAME = 'kraken'         # Ganti dengan exchange pilihan Anda (kraken, bybit, dll)
 CANDLES = 200                    # Jumlah candle yang diambil untuk analisis
 INTERVAL = 300                   # Jeda waktu antar siklus analisis dalam detik (300 detik = 5 menit)
@@ -41,15 +42,11 @@ alerted = {}
 
 def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5, use_wicks: bool = True) -> dict | None:
     """
-    Mendeteksi Order Block terbaru berdasarkan logika Pine Script:
-    1. Satu lilin berlawanan arah.
-    2. Diikuti oleh 'periods' lilin searah.
-    3. Pergerakan harga melebihi 'threshold' persen.
+    Mendeteksi Order Block terbaru berdasarkan logika Pine Script.
     """
     df_ = df.copy()
     ob_period = periods + 1
 
-    # Loop dari candle terbaru ke belakang untuk menemukan OB terakhir
     for i in range(len(df_) - 1, ob_period, -1):
         window = df_.iloc[i - ob_period : i]
         
@@ -59,7 +56,7 @@ def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5,
         close_ob_potential = potential_ob_candle['c']
         close_last_in_sequence = subsequent_candles.iloc[-1]['c']
         
-        if close_ob_potential == 0: continue # Menghindari pembagian dengan nol
+        if close_ob_potential == 0: continue
             
         absmove = ((abs(close_last_in_sequence - close_ob_potential)) / close_ob_potential) * 100
         relmove = absmove >= threshold
@@ -67,7 +64,6 @@ def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5,
         if not relmove:
             continue
 
-        # Cek OB Bullish
         is_potential_bullish_ob = potential_ob_candle['c'] < potential_ob_candle['o']
         are_subsequent_up = (subsequent_candles['c'] > subsequent_candles['o']).all()
 
@@ -76,7 +72,6 @@ def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5,
             ob_low = potential_ob_candle['l']
             return {'type': 'Bullish', 'min': ob_low, 'max': ob_high, 't': potential_ob_candle['t']}
 
-        # Cek OB Bearish
         is_potential_bearish_ob = potential_ob_candle['c'] > potential_ob_candle['o']
         are_subsequent_down = (subsequent_candles['c'] < subsequent_candles['o']).all()
 
@@ -97,7 +92,16 @@ async def analyze(symbol: str):
     try:
         print(f"🔍 Menganalisis {symbol} pada timeframe {TIMEFRAME}...")
 
-        ohlcv = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLES)
+        # PENYEMPURNAAN: Menambahkan try-except untuk pengambilan data
+        try:
+            ohlcv = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLES)
+            if len(ohlcv) < CANDLES:
+                print(f"[SKIP] Data tidak cukup untuk {symbol} ({len(ohlcv)}/{CANDLES} lilin).")
+                return
+        except Exception as e:
+            print(f"[ERROR] Gagal mengambil data untuk {symbol}: {e}")
+            return # Hentikan analisis untuk simbol ini jika data gagal diambil
+
         df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
         current_price = df['c'].iloc[-1]
 
@@ -130,6 +134,7 @@ async def analyze(symbol: str):
                     }
                 }
                 
+                # INI ADALAH BAGIAN YANG DIPERBAIKI
                 prompt = f"""
 SYSTEM: Anda adalah seorang analis trading Smart Money Concepts (SMC) profesional. Tugas Anda adalah memberikan rekomendasi Stop Loss (SL) dan Take Profit (TP) yang logis berdasarkan data yang diberikan.
 
