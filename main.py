@@ -8,102 +8,97 @@ import logging
 from telegram import Bot
 import google.generativeai as genai
 
-# Menerapkan nest_asyncio agar asyncio bisa berjalan di lingkungan seperti notebook
+# Menerapkan nest_asyncio
 nest_asyncio.apply()
 
-# --- 1. Konfigurasi Logging ---
+# Konfigurasi Logging
 logging.basicConfig(
-    filename='trading_bot.log',
+    filename='/app/trading_bot.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+logging.getLogger().addHandler(logging.StreamHandler())  # Log to console for Fly.io
 
-# --- 2. Konfigurasi & Inisialisasi ---
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
+# Konfigurasi & Inisialisasi
+try:
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+    CHAT_ID = os.getenv('CHAT_ID')
 
-# Validasi variabel lingkungan
-missing_vars = [var for var in ['GEMINI_API_KEY', 'TELEGRAM_TOKEN', 'CHAT_ID'] if not os.getenv(var)]
-if missing_vars:
-    logging.error(f"Variabel lingkungan berikut belum diatur: {', '.join(missing_vars)}")
-    raise ValueError(f"Variabel lingkungan berikut belum diatur: {', '.join(missing_vars)}")
+    missing_vars = [var for var in ['GEMINI_API_KEY', 'TELEGRAM_TOKEN', 'CHAT_ID'] if not os.getenv(var)]
+    if missing_vars:
+        logging.error(f"Variabel lingkungan berikut belum diatur: {', '.join(missing_vars)}")
+        raise ValueError(f"Variabel lingkungan berikut belum diatur: {', '.join(missing_vars)}")
 
-# Inisialisasi layanan
-genai.configure(api_key=GEMINI_API_KEY)
-bot = Bot(token=TELEGRAM_TOKEN)
-exchange = None  # Akan diinisialisasi di main()
+    genai.configure(api_key=GEMINI_API_KEY)
+    bot = Bot(token=TELEGRAM_TOKEN)
+    exchange = None
+except Exception as e:
+    logging.error(f"Gagal menginisialisasi layanan: {e}")
+    raise
 
-# --- 3. Pengaturan Strategi ---
+# Pengaturan Strategi
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT']
 TIMEFRAME = '15m'
 EXCHANGE_NAME = 'kraken'
 CANDLES = 200
-INTERVAL = 300  # 5 menit
-ALERTED_MAX_AGE = 86400  # 24 jam (dalam detik) untuk pembersihan alerted
-
-# Dictionary untuk melacak notifikasi
+INTERVAL = 300
+ALERTED_MAX_AGE = 86400
 alerted = {}
 
-# --- 4. Fungsi Pendukung ---
 def clean_alerted():
-    """Membersihkan entri alerted yang lebih tua dari ALERTED_MAX_AGE."""
     current_time = pd.Timestamp.now().timestamp() * 1000
     global alerted
     alerted = {k: v for k, v in alerted.items() if current_time - float(k.split('_')[-1]) < ALERTED_MAX_AGE * 1000}
     logging.info("Membersihkan entri alerted yang kadaluarsa.")
 
 def find_order_block(df: pd.DataFrame, periods: int = 5, threshold: float = 0.5, use_wicks: bool = True) -> dict | None:
-    """
-    Mendeteksi Order Block terbaru berdasarkan logika Pine Script.
-    """
-    df_ = df.copy()
-    ob_period = periods + 1
+    try:
+        df_ = df.copy()
+        ob_period = periods + 1
 
-    for i in range(len(df_) - 1, ob_period, -1):
-        window = df_.iloc[i - ob_period : i]
-        potential_ob_candle = window.iloc[0]
-        subsequent_candles = window.iloc[1:]
+        for i in range(len(df_) - 1, ob_period, -1):
+            window = df_.iloc[i - ob_period : i]
+            potential_ob_candle = window.iloc[0]
+            subsequent_candles = window.iloc[1:]
 
-        close_ob_potential = potential_ob_candle['c']
-        close_last_in_sequence = subsequent_candles.iloc[-1]['c']
-        
-        if close_ob_potential == 0:
-            continue
+            close_ob_potential = potential_ob_candle['c']
+            close_last_in_sequence = subsequent_candles.iloc[-1]['c']
             
-        absmove = ((abs(close_last_in_sequence - close_ob_potential)) / close_ob_potential) * 100
-        relmove = absmove >= threshold
+            if close_ob_potential == 0:
+                continue
+                
+            absmove = ((abs(close_last_in_sequence - close_ob_potential)) / close_ob_potential) * 100
+            relmove = absmove >= threshold
 
-        if not relmove:
-            continue
+            if not relmove:
+                continue
 
-        # Validasi volume
-        if potential_ob_candle['v'] < df_['v'].mean() * 1.5:
-            continue
+            if potential_ob_candle['v'] < df_['v'].mean() * 1.5:
+                continue
 
-        is_potential_bullish_ob = potential_ob_candle['c'] < potential_ob_candle['o']
-        are_subsequent_up = (subsequent_candles['c'] > subsequent_candles['o']).all()
+            is_potential_bullish_ob = potential_ob_candle['c'] < potential_ob_candle['o']
+            are_subsequent_up = (subsequent_candles['c'] > subsequent_candles['o']).all()
 
-        if is_potential_bullish_ob and are_subsequent_up:
-            ob_high = potential_ob_candle['h'] if use_wicks else potential_ob_candle['o']
-            ob_low = potential_ob_candle['l']
-            return {'type': 'Bullish', 'min': ob_low, 'max': ob_high, 't': potential_ob_candle['t']}
+            if is_potential_bullish_ob and are_subsequent_up:
+                ob_high = potential_ob_candle['h'] if use_wicks else potential_ob_candle['o']
+                ob_low = potential_ob_candle['l']
+                return {'type': 'Bullish', 'min': ob_low, 'max': ob_high, 't': potential_ob_candle['t']}
 
-        is_potential_bearish_ob = potential_ob_candle['c'] > potential_ob_candle['o']
-        are_subsequent_down = (subsequent_candles['c55.0' < subsequent_candles['o']).all()
+            is_potential_bearish_ob = potential_ob_candle['c'] > potential_ob_candle['o']
+            are_subsequent_down = (subsequent_candles['c'] < subsequent_candles['o']).all()
 
-        if is_potential_bearish_ob and are_subsequent_down:
-            ob_high = potential_ob_candle['h']
-            ob_low = potential_ob_candle['l'] if use_wicks else potential_ob_candle['o']
-            return {'type': 'Bearish', 'min': ob_low, 'max': ob_high, 't': potential_ob_candle['t']}
-            
-    return None
+            if is_potential_bearish_ob and are_subsequent_down:
+                ob_high = potential_ob_candle['h']
+                ob_low = potential_ob_candle['l'] if use_wicks else potential_ob_candle['o']
+                return {'type': 'Bearish', 'min': ob_low, 'max': ob_high, 't': potential_ob_candle['t']}
+                
+        return None
+    except Exception as e:
+        logging.error(f"Error di find_order_block: {e}")
+        return None
 
-# --- 5. Fungsi Analisis Inti ---
 async def analyze(symbol: str):
-    """
-    Menganalisis simbol untuk mendeteksi Order Block dan mengirim notifikasi.
-    """
     try:
         logging.info(f"Menganalisis {symbol} pada timeframe {TIMEFRAME}")
         ohlcv = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLES)
@@ -179,21 +174,25 @@ Berikan hasil dalam format JSON dengan field: recommended_sl, recommended_tp, an
     except Exception as e:
         logging.error(f"Gagal menganalisis {symbol}: {e}")
 
-# --- 6. Fungsi Utama ---
 async def main():
     global exchange
-    exchange = ccxt.async_support.kraken({
-        'enableRateLimit': True,
-    })
-    logging.info("Koneksi exchange diinisialisasi")
+    try:
+        exchange = ccxt.async_support.kraken({
+            'enableRateLimit': True,
+        })
+        logging.info("Koneksi exchange diinisialisasi")
+    except Exception as e:
+        logging.error(f"Gagal menginisialisasi exchange: {e}")
+        raise
 
     try:
+        await bot.send_message(CHAT_ID, "✅ Bot dimulai.")
         while True:
             current_time_str = pd.Timestamp.now(tz='Asia/Jakarta').strftime('%Y-%m-%d %H:%M:%S')
             logging.info(f"Memulai siklus analisis baru ({current_time_str})")
             print(f"\n--- Memulai Siklus Analisis Baru ({current_time_str}) ---")
             
-            clean_alerted()  # Bersihkan alerted sebelum siklus baru
+            clean_alerted()
             await asyncio.gather(*[analyze(sym) for sym in SYMBOLS])
             
             print(f"--- Siklus Selesai. Tidur selama {INTERVAL // 60} menit... ---")
@@ -209,6 +208,8 @@ async def main():
             logging.info("Koneksi exchange ditutup")
             await bot.send_message(CHAT_ID, "❌ Bot dihentikan. Koneksi exchange ditutup.")
 
-# --- 7. Jalankan Bot ---
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Kesalahan saat menjalankan bot: {e}")
