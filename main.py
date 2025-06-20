@@ -21,8 +21,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 
 # --- Konstanta utama ---
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT']
-HI_TF = '1h'
-LO_TF = '15m'
+HI_TF = '15m'
+LO_TF = '5m'
 EXCHANGE_NAME = 'kraken'
 CANDLES = 200
 INTERVAL = 300  # 5 menit
@@ -33,7 +33,6 @@ alerted = {}
 exchange = None  # akan diinisialisasi nanti
 
 # --- Fungsi-fungsi analisis ---
-
 def find_swing(df, lookback=10):
     highs, lows = [], []
     for i in range(lookback, len(df) - lookback):
@@ -80,72 +79,78 @@ Output dalam JSON:
 async def analyze(symbol):
     try:
         print(f"🔍 Menganalisis {symbol}...")
-        
-        high_ohlcv = await exchange.fetch_ohlcv(symbol, HI_TF, limit=CANDLES)
+        # --- Timeframe besar ---
+        try:
+            high_ohlcv = await exchange.fetch_ohlcv(symbol, HI_TF, limit=CANDLES)
+        except Exception as e:
+            print(f"[ERROR] Fetch OHLCV {symbol} 1h: {e}")
+            await bot.send_message(CHAT_ID, f"[ERROR] Fetch OHLCV {symbol} 1h: {e}")
+            return
+
         dfh = pd.DataFrame(high_ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
         bos = detect_bos(dfh)
         if bos:
+            print(f"[BOS] {symbol}: {bos}")
             bos_state[symbol] = bos
-            print(f"✅ BOS terdeteksi {symbol}: {bos}")
 
         if symbol not in bos_state:
-            print(f"⚠️ BOS belum tersedia untuk {symbol}, dilewati.")
+            print(f"[SKIP] Tidak ada BOS untuk {symbol}")
             return
 
-        low_ohlcv = await exchange.fetch_ohlcv(symbol, LO_TF, limit=CANDLES)
+        # --- Timeframe kecil ---
+        try:
+            low_ohlcv = await exchange.fetch_ohlcv(symbol, LO_TF, limit=CANDLES)
+        except Exception as e:
+            print(f"[ERROR] Fetch OHLCV {symbol} 15m: {e}")
+            await bot.send_message(CHAT_ID, f"[ERROR] Fetch OHLCV {symbol} 15m: {e}")
+            return
+
         poi = find_fvg(low_ohlcv)
-
-        if not poi:
-            print(f"⛔ Tidak ada FVG pada {symbol}")
+        if not poi or not poi['type'].startswith(bos_state[symbol]['type']):
+            print(f"[POI] Tidak cocok untuk {symbol}")
             return
 
-        if not poi['type'].startswith(bos_state[symbol]['type']):
-            print(f"🚫 POI {poi['type']} tidak cocok dengan BOS {bos_state[symbol]['type']} pada {symbol}")
-            return
-
-        cp = low_ohlcv[-1][4]
-        print(f"📌 POI ditemukan {symbol}: {poi}, harga sekarang: {cp}")
-
+        cp = low_ohlcv[-1][4]  # Close price
         if poi['min'] <= cp <= poi['max'] and alerted.get(symbol) != poi['t']:
+            print(f"[MATCH] Harga masuk POI: {cp} ∈ ({poi['min']} - {poi['max']})")
             ai_response = await ask_gemini(symbol, bos_state[symbol], poi, cp)
-            print(f"🤖 Respon Gemini untuk {symbol}:\n{ai_response}")
-            await bot.send_message(chat_id=CHAT_ID, text=f"[LOG] {symbol} Gemini:\n{ai_response}")
+
+            await bot.send_message(CHAT_ID, f"[LOG] {symbol} Gemini:\n{ai_response}")
 
             try:
                 data = json.loads(ai_response.replace("```json", "").replace("```", "").strip())
                 keputusan = data.get("keputusan", "").upper()
                 if keputusan in ['LONG', 'SHORT']:
                     msg = f"📈 Gemini SIGNAL {symbol}: {keputusan} (POI: {poi['type']})"
-                    print(msg)
-                    await bot.send_message(chat_id=CHAT_ID, text=msg)
+                    await bot.send_message(CHAT_ID, msg)
                     alerted[symbol] = poi['t']
-                else:
-                    print(f"⏸️ Keputusan Gemini: {keputusan} (menunggu)")
             except Exception as e:
                 print(f"[ERROR] JSON parse {symbol}: {e}")
-                await bot.send_message(chat_id=CHAT_ID, text=f"[ERROR] JSON parse {symbol}: {e}")
+                await bot.send_message(CHAT_ID, f"[ERROR] JSON parse {symbol}: {e}")
+        else:
+            print(f"[NO ENTRY] Harga belum masuk POI {symbol}")
+
     except Exception as e:
-        print(f"[ERROR] Analyze {symbol}: {e}")
-        await bot.send_message(chat_id=CHAT_ID, text=f"[ERROR] Analyze {symbol}: {e}")
+        print(f"[FATAL] {symbol}: {e}")
+        await bot.send_message(CHAT_ID, f"[FATAL] Analyze {symbol}: {e}")
 
 # --- Loop utama ---
-
 async def main():
     global exchange
-    print("🚀 Memulai bot Gemini SMC...")
     exchange = getattr(ccxt, EXCHANGE_NAME)({'enableRateLimit': True})
-
     await bot.send_message(CHAT_ID, "✅ Bot Gemini SMC berjalan...")
+    print("♻️ Loop analisis dimulai.")
 
     try:
         while True:
             await asyncio.gather(*[analyze(sym) for sym in SYMBOLS])
+            print("✅ Siklus selesai. Tidur 5 menit...\n")
             await asyncio.sleep(INTERVAL)
     finally:
         if exchange:
             await exchange.close()
-            print("🛑 Menutup koneksi exchange.")
-            await bot.send_message(chat_id=CHAT_ID, text="❌ Exchange connection closed.")
+            print("❌ Exchange connection closed.")
+            await bot.send_message(CHAT_ID, "❌ Exchange connection closed.")
 
 if __name__ == '__main__':
     asyncio.run(main())
