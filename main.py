@@ -90,7 +90,8 @@ async def analyze(symbol):
         if latest_ob['low'] <= cp <= latest_ob['high'] and alerted.get(symbol) != latest_ob['t']:
             print(f"[OB-MATCH] {symbol}: Harga masuk OB! ({cp} ∈ [{latest_ob['low']} - {latest_ob['high']}])")
 
-            prompt = f"""Berikut adalah data sinyal yang saya punya:
+prompt = f"""
+Berikut adalah data sinyal yang saya punya:
 - Symbol: {symbol}
 - Jenis OB: {latest_ob['type'].upper()}
 - Area OB: {latest_ob['low']} - {latest_ob['high']}
@@ -98,9 +99,8 @@ async def analyze(symbol):
 
 Apa keputusan kamu (LONG / SHORT / SKIP)? Berikan output JSON seperti ini:
 
-```json
 {{ "keputusan": "LONG", "alasan": "..." }}
-```"""
+""".strip()
 
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             response = await model.generate_content_async(prompt)
