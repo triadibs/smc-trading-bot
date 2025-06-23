@@ -5,10 +5,10 @@ import nest_asyncio
 import json
 import pandas as pd
 from telegram import Bot
+from telegram.constants import ParseMode
 import google.generativeai as genai
 
 # Mengaplikasikan nest_asyncio agar event loop bisa berjalan di dalam event loop lain.
-# Berguna untuk lingkungan seperti Jupyter/Spyder, namun aman digunakan di script biasa.
 nest_asyncio.apply()
 
 # --- 1. Load Credentials dan Konfigurasi Awal ---
@@ -18,24 +18,25 @@ try:
     CHAT_ID = os.environ['CHAT_ID']
 except KeyError as e:
     print(f"FATAL: Variabel environment tidak ditemukan: {e}. Pastikan Anda sudah mengaturnya.")
-    exit() # Keluar dari script jika credentials tidak ada
+    exit()
 
 # Konfigurasi API
 genai.configure(api_key=GEMINI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # --- 2. Konstanta Utama ---
+BOT_VERSION = "2.1" # Versi bot untuk notifikasi
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT']
 TIMEFRAME = '15m'
-EXCHANGE_NAME = 'kraken' # Ganti dengan exchange lain jika perlu, misal: 'binance'
+EXCHANGE_NAME = 'kraken'
 CANDLES = 200
 INTERVAL = 300  # 5 menit (dalam detik)
 ORDER_BLOCK_PERIODS = 5
-ORDER_BLOCK_THRESHOLD = 0.3 # Persentase pergerakan harga minimum setelah OB
+ORDER_BLOCK_THRESHOLD = 0.3
 
 # --- 3. State Global ---
-alerted = {}  # Dictionary untuk melacak notifikasi yang sudah terkirim
-exchange = None # Objek exchange akan diinisialisasi di fungsi main
+alerted = {}
+exchange = None
 
 # --- 4. Fungsi-fungsi Inti ---
 
@@ -44,13 +45,13 @@ def detect_order_blocks(df: pd.DataFrame, periods=5, threshold=0.0, use_wicks=Fa
     obs = []
     n = periods + 1
     if len(df) <= n:
-        return obs  # Tidak cukup data untuk dianalisis
+        return obs
 
     for i in range(n, len(df)):
         ob_candle = df.iloc[i - n]
         sub_df = df.iloc[i - periods:i]
 
-        # Bullish OB: 1 candle turun diikuti oleh 'periods' candle naik
+        # Bullish OB
         is_bullish_ob_candidate = ob_candle['close'] < ob_candle['open'] and all(sub_df['close'] > sub_df['open'])
         if is_bullish_ob_candidate:
             move_pct = abs(df.iloc[i - 1]['close'] - ob_candle['close']) / ob_candle['close'] * 100
@@ -62,7 +63,7 @@ def detect_order_blocks(df: pd.DataFrame, periods=5, threshold=0.0, use_wicks=Fa
                     'avg': (high + low) / 2, 't': df.iloc[i - n]['t']
                 })
 
-        # Bearish OB: 1 candle naik diikuti oleh 'periods' candle turun
+        # Bearish OB
         is_bearish_ob_candidate = ob_candle['close'] > ob_candle['open'] and all(sub_df['close'] < sub_df['open'])
         if is_bearish_ob_candidate:
             move_pct = abs(df.iloc[i - 1]['close'] - ob_candle['close']) / ob_candle['close'] * 100
@@ -83,12 +84,10 @@ async def analyze(symbol: str):
     try:
         print(f"🔍 Menganalisis {symbol}...")
         
-        # Mengambil data OHLCV
         try:
             ohlcv = await exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLES)
         except Exception as e:
             print(f"❌ [ERROR] Gagal mengambil OHLCV untuk {symbol}: {e}")
-            # Tidak mengirim notif ke Telegram agar tidak spam jika ada masalah jaringan sementara
             return
 
         if not ohlcv or len(ohlcv) < CANDLES:
@@ -105,15 +104,12 @@ async def analyze(symbol: str):
         latest_ob = obs[-1]
         current_price = df['close'].iloc[-1]
 
-        # KONDISI UTAMA: Harga masuk ke zona OB terbaru & belum ada notifikasi untuk OB ini
         price_in_zone = latest_ob['low'] <= current_price <= latest_ob['high']
         is_new_alert = alerted.get(symbol) != latest_ob['t']
 
         if price_in_zone and is_new_alert:
             print(f"🎯 [OB-MATCH] {symbol}: Harga masuk zona OB! ({current_price} ∈ [{latest_ob['low']} - {latest_ob['high']}])")
 
-            # Blok ini hanya berjalan jika ada sinyal baru, memanggil AI dan mengirim notifikasi.
-            # Dibungkus dalam try-except untuk menangani error dari API Gemini atau parsing JSON.
             try:
                 prompt = (
                     f"Anda adalah seorang analis trading ahli. Berdasarkan data berikut, berikan keputusan trading (LONG, SHORT, atau SKIP) dan alasan singkat dalam format JSON.\n"
@@ -130,7 +126,8 @@ async def analyze(symbol: str):
                 response = await model.generate_content_async(prompt)
                 ai_response = response.text.strip()
 
-                await bot.send_message(CHAT_ID, f"📝 [LOG] Respons Gemini untuk {symbol}:\n`{ai_response}`", parse_mode='MarkdownV2')
+                # Log respons AI dalam format code block agar aman
+                await bot.send_message(CHAT_ID, f"📝 [LOG] Respons Gemini untuk {symbol}:\n`{ai_response}`", parse_mode=ParseMode.MARKDOWN_V2)
 
                 cleaned_json_str = ai_response.replace("```json", "").replace("```", "").strip()
                 data = json.loads(cleaned_json_str)
@@ -139,23 +136,26 @@ async def analyze(symbol: str):
                 alasan = data.get("alasan", "Tidak ada alasan yang diberikan.")
 
                 if keputusan in ['LONG', 'SHORT']:
+                    # PERBAIKAN: Hapus format ` ` pada harga dan alasan untuk menghindari error parsing.
+                    # Biarkan format * * karena tidak mengandung karakter spesial.
                     msg = (
                         f"🚀 *Sinyal Gemini untuk {symbol}* 🚀\n\n"
-                        f"*Keputusan: {keputusan}*\n"
-                        f"Tipe OB: `{latest_ob['type']}`\n"
-                        f"Harga Saat Ini: `{current_price}`\n\n"
+                        f"*Keputusan:* {keputusan}\n"
+                        f"*Tipe OB:* `{latest_ob['type']}`\n"
+                        f"*Harga Saat Ini:* {current_price}\n\n"
                         f"*Alasan:* {alasan}"
                     )
-                    await bot.send_message(CHAT_ID, msg, parse_mode='MarkdownV2')
-                    alerted[symbol] = latest_ob['t']  # Tandai notifikasi sudah dikirim
+                    await bot.send_message(CHAT_ID, msg, parse_mode=ParseMode.MARKDOWN_V2)
+                    alerted[symbol] = latest_ob['t']
                 else:
                     print(f"🤖 Gemini memutuskan SKIP untuk {symbol}. Alasan: {alasan}")
 
             except json.JSONDecodeError as e:
                 print(f"❌ [ERROR] Gagal parsing JSON dari Gemini untuk {symbol}: {e}")
-                await bot.send_message(CHAT_ID, f"❌ [ERROR] Gagal parsing JSON dari Gemini untuk {symbol}:\n`{ai_response}`", parse_mode='MarkdownV2')
+                await bot.send_message(CHAT_ID, f"❌ [ERROR] Gagal parsing JSON dari Gemini untuk {symbol}:\n`{ai_response}`", parse_mode=ParseMode.MARKDOWN_V2)
             except Exception as e:
                 print(f"❌ [ERROR] Terjadi kesalahan saat interaksi dengan Gemini untuk {symbol}: {e}")
+                # Kirim error sebagai teks biasa untuk keamanan
                 await bot.send_message(CHAT_ID, f"❌ [ERROR] Terjadi kesalahan saat interaksi dengan Gemini untuk {symbol}: {e}")
         
         elif price_in_zone and not is_new_alert:
@@ -164,7 +164,6 @@ async def analyze(symbol: str):
             print(f"⏳ {symbol}: Harga ({current_price}) belum memasuki zona OB terbaru ({latest_ob['low']} - {latest_ob['high']}).")
 
     except Exception as e:
-        # Menangkap error tak terduga dalam fungsi analyze
         print(f"💥 [FATAL] Kesalahan tidak terduga pada {symbol}: {e}")
 
 # --- 5. Loop Utama ---
@@ -174,7 +173,12 @@ async def main():
     global exchange
     try:
         exchange = getattr(ccxt, EXCHANGE_NAME)({'enableRateLimit': True})
-        await bot.send_message(CHAT_ID, f"✅ *Bot Gemini Order Block v2.0 Aktif*\nExchange: `{EXCHANGE_NAME.capitalize()}`", parse_mode='MarkdownV2')
+        
+        # PERBAIKAN: Escape karakter '.' pada versi bot secara manual.
+        safe_bot_version = BOT_VERSION.replace('.', '\\.')
+        startup_message = f"✅ *Bot Gemini Order Block v{safe_bot_version} Aktif*\nExchange: `{EXCHANGE_NAME.capitalize()}`"
+        await bot.send_message(CHAT_ID, startup_message, parse_mode=ParseMode.MARKDOWN_V2)
+        
         print("♻️ Loop analisis dimulai.")
 
         while True:
@@ -184,11 +188,13 @@ async def main():
 
     except Exception as e:
         print(f"🚨 [CRITICAL] Terjadi error di loop utama: {e}")
-        await bot.send_message(CHAT_ID, f"🚨 *Bot Berhenti Total*\nTerjadi error kritis di loop utama:\n`{e}`", parse_mode='MarkdownV2')
+        # Kirim error kritis dalam format code block agar aman
+        await bot.send_message(CHAT_ID, f"🚨 *Bot Berhenti Total*\nTerjadi error kritis di loop utama:\n`{e}`", parse_mode=ParseMode.MARKDOWN_V2)
     finally:
         if exchange:
             await exchange.close()
             print("❌ Koneksi exchange telah ditutup.")
+            # Kirim pesan penutupan sebagai teks biasa
             await bot.send_message(CHAT_ID, "🔌 Koneksi ke exchange telah ditutup.")
 
 # --- 6. Titik Masuk Eksekusi Program ---
@@ -197,4 +203,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Bot dihentikan secara manual oleh pengguna. Menutup koneksi...")
+        print("\n🛑 Bot dihentikan secara manual oleh pengguna. Menutup koneksi...")git push
