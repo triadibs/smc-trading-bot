@@ -3,4 +3,4 @@ export FLYCTL_INSTALL="/home/codespace/.fly"
 
   git add .
 git commit -m "perbarui"
-git push
+git push 
