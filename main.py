@@ -90,17 +90,14 @@ async def analyze(symbol):
         if latest_ob['low'] <= cp <= latest_ob['high'] and alerted.get(symbol) != latest_ob['t']:
             print(f"[OB-MATCH] {symbol}: Harga masuk OB! ({cp} ∈ [{latest_ob['low']} - {latest_ob['high']}])")
 
-prompt = f"""
-Berikut adalah data sinyal yang saya punya:
-- Symbol: {symbol}
-- Jenis OB: {latest_ob['type'].upper()}
-- Area OB: {latest_ob['low']} - {latest_ob['high']}
-- Harga sekarang: {cp}
-
-Apa keputusan kamu (LONG / SHORT / SKIP)? Berikan output JSON seperti ini:
-
-{{ "keputusan": "LONG", "alasan": "..." }}
-""".strip()
+prompt = (
+    f"Berikut adalah data sinyal:\n"
+    f"- Symbol: {symbol}\n"
+    f"- OB: {latest_ob['type']}\n"
+    f"- Harga: {cp}\n"
+    f"\n"
+    f"Apa keputusan kamu (LONG / SHORT / SKIP)? Format JSON: {{\"keputusan\": \"LONG\", \"alasan\": \"...\"}}"
+)
 
             model = genai.GenerativeModel('gemini-1.5-flash-latest')
             response = await model.generate_content_async(prompt)
